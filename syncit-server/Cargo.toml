@@ -10,6 +10,7 @@ autosurgeon.workspace = true
 axum = { version = "0.8.9", features = ["ws"] }
 serde.workspace = true
 serde_json.workspace = true
+syncit-core = { path = "../syncit-core" }
 tokio.workspace = true
 tower-http = { version = "0.7.0", features = ["trace"] }
 tracing = "0.1.44"

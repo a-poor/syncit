@@ -5607,6 +5607,7 @@ dependencies = [
  "axum",
  "serde",
  "serde_json",
+ "syncit-core",
  "tokio",
  "tower-http",
  "tracing",

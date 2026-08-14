@@ -1,4 +1,5 @@
 use anyhow::Result;
+use automerge::AutoCommit;
 use axum::{Json, Router, http::StatusCode, routing::get};
 use serde::Serialize;
 use tower_http::trace::{self, TraceLayer};
@@ -11,6 +12,17 @@ async fn main() -> Result<()> {
         .with_target(false)
         .compact()
         .init();
+
+    tracing::debug!("Setting up automerge document...");
+
+    // Create an automerge document in-memory
+    let mut doc = AutoCommit::new();
+
+    // Initialize the document with our state
+    let sd = syncit_core::SyncItDoc::new();
+    autosurgeon::reconcile(&mut doc, &sd)?;
+
+    tracing::debug!("Automerge document set up.");
 
     // build our application with a route
     let app = Router::new()

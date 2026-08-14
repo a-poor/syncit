@@ -7,3 +7,14 @@ pub struct SyncItDoc {
     pub count: Counter,
     pub desc: Text,
 }
+
+impl SyncItDoc {
+    pub fn new() -> Self {
+        Self {
+            name: "demo".into(),
+            active: true,
+            count: Counter::with_value(2),
+            desc: "Todo...".into(),
+        }
+    }
+}
