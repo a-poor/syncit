@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
-  "syncit_core",
-  "syncit_gui",
-  "syncit_server",
+  "syncit-core",
+  "syncit-gui",
+  "syncit-server",
 ]
 
 [workspace.dependencies]
