@@ -10,3 +10,5 @@ autosurgeon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
