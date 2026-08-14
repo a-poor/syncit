@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "gpui": {
+      "source": "a-poor/skills",
+      "sourceType": "github",
+      "skillPath": "skills/gpui/SKILL.md",
+      "computedHash": "a784a1ce9ebc5477c5cef4981ea2d8b36b70caf3a07cd50cf7df85ed6353c0e1"
+    }
+  }
+}
