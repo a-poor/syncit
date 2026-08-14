@@ -5,3 +5,12 @@ members = [
   "syncit_gui",
   "syncit_server",
 ]
+
+[workspace.dependencies]
+tokio = { version = "1.53.1", features = ["full"] }
+anyhow = "1.0.104"
+automerge = "0.11.0"
+autosurgeon = "0.13.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
