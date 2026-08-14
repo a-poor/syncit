@@ -1,0 +1,14 @@
+[package]
+name = "syncit-client"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+automerge.workspace = true
+autosurgeon.workspace = true
+futures-util = "0.3"
+syncit-core = { path = "../syncit-core" }
+tokio.workspace = true
+tokio-tungstenite = "0.29"
