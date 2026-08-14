@@ -1,58 +1,51 @@
 use anyhow::Result;
-use axum::{
-    Json, Router,
-    http::StatusCode,
-    routing::{get, post},
-};
-use serde::{Deserialize, Serialize};
+use axum::{Json, Router, http::StatusCode, routing::get};
+use serde::Serialize;
+use tower_http::trace::{self, TraceLayer};
+use tracing::Level;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // initialize tracing
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .compact()
+        .init();
 
     // build our application with a route
     let app = Router::new()
         // `GET /` goes to `root`
         .route("/", get(root))
-        // `POST /users` goes to `create_user`
-        .route("/users", post(create_user));
+        .route("/api/data", get(get_user))
+        .route("/api/ws", get(get_user))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
+        );
 
     // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3003").await?;
+
+    tracing::info!(port = "3003", "Starting");
+
     axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-// basic handler that responds with a static string
 async fn root() -> &'static str {
     "Hello, World!"
 }
 
-async fn create_user(
-    // this argument tells axum to parse the request body
-    // as JSON into a `CreateUser` type
-    Json(payload): Json<CreateUser>,
-) -> (StatusCode, Json<User>) {
-    // insert your application logic here
+async fn get_user() -> (StatusCode, Json<User>) {
     let user = User {
         id: 1337,
-        username: payload.username,
+        username: "foo".into(),
     };
-
-    // this will be converted into a JSON response
-    // with a status code of `201 Created`
     (StatusCode::CREATED, Json(user))
 }
 
-// the input to our `create_user` handler
-#[derive(Deserialize)]
-struct CreateUser {
-    username: String,
-}
-
-// the output to our `create_user` handler
 #[derive(Serialize)]
 struct User {
     id: u64,
