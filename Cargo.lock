@@ -5603,11 +5603,14 @@ dependencies = [
  "anyhow",
  "automerge",
  "autosurgeon",
+ "futures-util",
  "gpui",
  "gpui_platform",
  "serde",
  "serde_json",
+ "syncit-core",
  "tokio",
+ "tokio-tungstenite",
  "unicode-segmentation",
 ]
 

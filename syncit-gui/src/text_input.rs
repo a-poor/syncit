@@ -98,6 +98,23 @@ impl TextInput {
         }
     }
 
+    /// Replace the content from outside (e.g. a remote sync update),
+    /// clamping the selection to the new text.
+    pub fn set_content(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.content = text.into();
+        let mut start = self.selected_range.start.min(self.content.len());
+        while !self.content.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = self.selected_range.end.min(self.content.len());
+        while !self.content.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.selected_range = start..end;
+        self.marked_range = None;
+        cx.notify();
+    }
+
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
