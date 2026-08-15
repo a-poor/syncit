@@ -1,34 +1,34 @@
-//! Background sync actor: owns the automerge doc and the websocket
-//! connection to the sync server, bridging to the GUI over tokio channels
-//! (tokio's sync primitives are executor-agnostic, so the GUI side can await
-//! them from gpui's executor with no extra glue).
+//! Network shuttle: owns only the websocket connection to the sync server and
+//! ferries encoded automerge sync messages between the GUI (which owns the
+//! doc) and the server. Bridged over tokio channels, which are
+//! executor-agnostic so the GUI side can await them from gpui's executor.
 
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use automerge::{AutoCommit, sync::SyncDoc};
 use futures_util::{SinkExt, StreamExt};
-use syncit_core::SyncItDoc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 const SERVER_URL: &str = "ws://127.0.0.1:3003/api/ws";
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// A local edit made in the GUI, to be applied to the shared doc.
+/// Commands the GUI sends to the shuttle.
 #[derive(Debug)]
-pub enum LocalChange {
-    SetName(String),
-    SetActive(bool),
-    IncrementCount(i64),
-    SetDesc(String),
+pub enum NetCmd {
+    /// An encoded automerge sync message to forward to the server.
+    Send(Vec<u8>),
+    /// Enable or disable syncing. Disabling drops the connection, so it
+    /// exercises the same path as a real network failure.
+    SetEnabled(bool),
 }
 
-/// Events the actor pushes back to the GUI.
+/// Events the shuttle pushes to the GUI.
 #[derive(Debug)]
-pub enum SyncEvent {
+pub enum NetEvent {
     Status(SyncStatus),
-    Doc(SyncItDoc),
+    /// An encoded automerge sync message arrived from the server.
+    Recv(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,54 +36,97 @@ pub enum SyncStatus {
     Connecting,
     Connected,
     Offline,
+    Paused,
 }
 
-/// Spawn the sync actor on the tokio runtime. Returns the channel to send
-/// local changes into and the channel remote updates arrive on.
+/// Spawn the shuttle on the tokio runtime. Returns the channel to send
+/// commands into and the channel network events arrive on.
 pub fn start(
     handle: &tokio::runtime::Handle,
-) -> (
-    mpsc::UnboundedSender<LocalChange>,
-    mpsc::UnboundedReceiver<SyncEvent>,
-) {
-    let (change_tx, change_rx) = mpsc::unbounded_channel();
+) -> (mpsc::UnboundedSender<NetCmd>, mpsc::UnboundedReceiver<NetEvent>) {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    handle.spawn(run(change_rx, event_tx));
-    (change_tx, event_rx)
+    handle.spawn(run(cmd_rx, event_tx));
+    (cmd_tx, event_rx)
 }
 
-async fn run(
-    mut changes: mpsc::UnboundedReceiver<LocalChange>,
-    events: mpsc::UnboundedSender<SyncEvent>,
-) {
-    // The doc outlives individual connections so edits made while offline
-    // survive and get pushed on reconnect.
-    let mut doc = AutoCommit::new();
+/// How a connection ended, when it wasn't a network error.
+enum ConnEnd {
+    GuiGone,
+    Disabled,
+}
+
+async fn run(mut cmds: mpsc::UnboundedReceiver<NetCmd>, events: mpsc::UnboundedSender<NetEvent>) {
+    let mut enabled = true;
     loop {
-        let _ = events.send(SyncEvent::Status(SyncStatus::Connecting));
-        match tokio_tungstenite::connect_async(SERVER_URL).await {
-            Ok((socket, _)) => {
-                let _ = events.send(SyncEvent::Status(SyncStatus::Connected));
-                match run_connected(socket, &mut doc, &mut changes, &events).await {
-                    Ok(()) => return, // GUI is gone
-                    Err(err) => eprintln!("sync: connection lost: {err:#}"),
+        if !enabled {
+            let _ = events.send(NetEvent::Status(SyncStatus::Paused));
+            loop {
+                match cmds.recv().await {
+                    None => return, // GUI is gone
+                    Some(NetCmd::SetEnabled(true)) => {
+                        enabled = true;
+                        break;
+                    }
+                    Some(_) => {} // drop sends & redundant disables while paused
                 }
             }
-            Err(err) => eprintln!("sync: connect failed: {err:#}"),
         }
-        let _ = events.send(SyncEvent::Status(SyncStatus::Offline));
 
-        // While offline, keep applying local edits and wait before retrying.
-        let retry = tokio::time::sleep(RETRY_DELAY);
-        tokio::pin!(retry);
-        loop {
-            tokio::select! {
-                _ = &mut retry => break,
-                change = changes.recv() => match change {
-                    Some(change) => apply_change(&mut doc, change),
-                    None => return, // GUI is gone
-                },
+        let _ = events.send(NetEvent::Status(SyncStatus::Connecting));
+        let socket = match tokio_tungstenite::connect_async(SERVER_URL).await {
+            Ok((socket, _)) => socket,
+            Err(err) => {
+                eprintln!("sync: connect failed: {err:#}");
+                let _ = events.send(NetEvent::Status(SyncStatus::Offline));
+                match wait_retry(&mut cmds).await {
+                    Some(e) => enabled = e,
+                    None => return,
+                }
+                continue;
             }
+        };
+
+        // Discard sends generated against a previous connection's sync state;
+        // the GUI starts fresh once it sees Connected. Commands still apply.
+        while let Ok(cmd) = cmds.try_recv() {
+            if let NetCmd::SetEnabled(e) = cmd {
+                enabled = e;
+            }
+        }
+        if !enabled {
+            continue;
+        }
+
+        let _ = events.send(NetEvent::Status(SyncStatus::Connected));
+        match run_connected(socket, &mut cmds, &events).await {
+            Ok(ConnEnd::GuiGone) => return,
+            Ok(ConnEnd::Disabled) => enabled = false,
+            Err(err) => {
+                eprintln!("sync: connection lost: {err:#}");
+                let _ = events.send(NetEvent::Status(SyncStatus::Offline));
+                match wait_retry(&mut cmds).await {
+                    Some(e) => enabled = e,
+                    None => return,
+                }
+            }
+        }
+    }
+}
+
+/// Wait out the retry delay, still processing commands. Returns the desired
+/// enabled state (early on disable), or None if the GUI hung up.
+async fn wait_retry(cmds: &mut mpsc::UnboundedReceiver<NetCmd>) -> Option<bool> {
+    let retry = tokio::time::sleep(RETRY_DELAY);
+    tokio::pin!(retry);
+    loop {
+        tokio::select! {
+            _ = &mut retry => return Some(true),
+            cmd = cmds.recv() => match cmd {
+                None => return None,
+                Some(NetCmd::SetEnabled(false)) => return Some(false),
+                Some(_) => {} // stale sends & redundant enables, drop
+            },
         }
     }
 }
@@ -91,74 +134,35 @@ async fn run(
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Drive one connection: push local changes as they arrive, apply incoming
-/// sync messages, and notify the GUI whenever the doc actually changes.
-/// Returns Ok(()) only when the GUI side has hung up.
+/// Forward bytes in both directions until the connection drops, sync is
+/// disabled, or the GUI hangs up.
 async fn run_connected(
     mut socket: WsStream,
-    doc: &mut AutoCommit,
-    changes: &mut mpsc::UnboundedReceiver<LocalChange>,
-    events: &mpsc::UnboundedSender<SyncEvent>,
-) -> Result<()> {
-    let mut sync_state = automerge::sync::State::new();
-    send_pending(&mut socket, doc, &mut sync_state).await?;
-
+    cmds: &mut mpsc::UnboundedReceiver<NetCmd>,
+    events: &mpsc::UnboundedSender<NetEvent>,
+) -> Result<ConnEnd> {
     loop {
         tokio::select! {
-            change = changes.recv() => match change {
-                Some(change) => {
-                    apply_change(doc, change);
-                    send_pending(&mut socket, doc, &mut sync_state).await?;
+            cmd = cmds.recv() => match cmd {
+                Some(NetCmd::Send(bytes)) => socket.send(Message::Binary(bytes.into())).await?,
+                Some(NetCmd::SetEnabled(false)) => {
+                    socket.close(None).await.ok();
+                    return Ok(ConnEnd::Disabled);
                 }
+                Some(NetCmd::SetEnabled(true)) => {}
                 None => {
                     socket.close(None).await.ok();
-                    return Ok(());
+                    return Ok(ConnEnd::GuiGone);
                 }
             },
             frame = socket.next() => match frame {
                 Some(Ok(Message::Binary(bytes))) => {
-                    let heads_before = doc.get_heads();
-                    let msg = automerge::sync::Message::decode(&bytes)?;
-                    doc.sync().receive_sync_message(&mut sync_state, msg)?;
-                    send_pending(&mut socket, doc, &mut sync_state).await?;
-                    if doc.get_heads() != heads_before {
-                        let sd: SyncItDoc = autosurgeon::hydrate(doc)?;
-                        let _ = events.send(SyncEvent::Doc(sd));
-                    }
+                    let _ = events.send(NetEvent::Recv(bytes.into()));
                 }
                 Some(Ok(Message::Close(_))) | None => bail!("server closed the connection"),
                 Some(Ok(_)) => {} // ignore text/ping/pong frames
                 Some(Err(err)) => return Err(err.into()),
             },
         }
-    }
-}
-
-/// Send every sync message the doc currently has queued up.
-async fn send_pending(
-    socket: &mut WsStream,
-    doc: &mut AutoCommit,
-    sync_state: &mut automerge::sync::State,
-) -> Result<()> {
-    while let Some(msg) = doc.sync().generate_sync_message(sync_state) {
-        socket.send(Message::Binary(msg.encode().into())).await?;
-    }
-    Ok(())
-}
-
-/// Apply a local edit to the doc. Before the first successful sync the doc is
-/// empty and can't hydrate; seed it with the default doc so edits made at
-/// startup while offline still land (automerge merges with the server's copy
-/// once we connect).
-fn apply_change(doc: &mut AutoCommit, change: LocalChange) {
-    let mut sd: SyncItDoc = autosurgeon::hydrate(doc).unwrap_or_else(|_| SyncItDoc::new());
-    match change {
-        LocalChange::SetName(name) => sd.name = name,
-        LocalChange::SetActive(active) => sd.active = active,
-        LocalChange::IncrementCount(delta) => sd.count.increment(delta),
-        LocalChange::SetDesc(desc) => sd.desc.update(&desc),
-    }
-    if let Err(err) = autosurgeon::reconcile(doc, &sd) {
-        eprintln!("sync: failed to apply local change: {err:#}");
     }
 }

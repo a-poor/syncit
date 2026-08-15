@@ -1,13 +1,15 @@
 mod sync;
 mod text_input;
 
+use automerge::{AutoCommit, sync::SyncDoc};
 use gpui::{
     App, AsyncApp, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable, KeyBinding, Task,
     Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
+use syncit_core::SyncItDoc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::sync::{LocalChange, SyncEvent, SyncStatus};
+use crate::sync::{NetCmd, NetEvent, SyncStatus};
 use crate::text_input::TextInput;
 
 actions!(syncit, [Quit]);
@@ -18,20 +20,25 @@ struct SyncitApp {
     desc: Entity<TextInput>,
     active: bool,
     count: i64,
+    // The GUI owns the doc: edits apply here synchronously, and the sync
+    // protocol pumps over the network channels between frames.
+    doc: AutoCommit,
+    sync_state: automerge::sync::State,
     status: SyncStatus,
-    changes: UnboundedSender<LocalChange>,
-    // Last text values exchanged with the sync actor, used to tell genuine
-    // local edits apart from remote updates we applied to the inputs ourselves.
+    sync_enabled: bool,
+    net_tx: UnboundedSender<NetCmd>,
+    // Last text values pushed into the inputs, used to tell genuine local
+    // edits apart from remote updates we applied to the inputs ourselves.
     last_name: String,
     last_desc: String,
-    _events_task: Task<()>,
+    _net_task: Task<()>,
 }
 
 impl SyncitApp {
     fn new(
         cx: &mut Context<Self>,
-        changes: UnboundedSender<LocalChange>,
-        mut events: UnboundedReceiver<SyncEvent>,
+        net_tx: UnboundedSender<NetCmd>,
+        mut events: UnboundedReceiver<NetEvent>,
     ) -> Self {
         let name = cx.new(|cx| TextInput::new(cx, "Name…", false));
         let desc = cx.new(|cx| TextInput::new(cx, "Description…", true));
@@ -40,7 +47,7 @@ impl SyncitApp {
             let content = input.read(cx).content.to_string();
             if content != this.last_name {
                 this.last_name = content.clone();
-                this.changes.send(LocalChange::SetName(content)).ok();
+                this.edit(cx, |sd| sd.name = content);
             }
         })
         .detach();
@@ -48,15 +55,15 @@ impl SyncitApp {
             let content = input.read(cx).content.to_string();
             if content != this.last_desc {
                 this.last_desc = content.clone();
-                this.changes.send(LocalChange::SetDesc(content)).ok();
+                this.edit(cx, |sd| sd.desc.update(&content));
             }
         })
         .detach();
 
-        let events_task = cx.spawn(async move |this, cx: &mut AsyncApp| {
+        let net_task = cx.spawn(async move |this, cx: &mut AsyncApp| {
             while let Some(event) = events.recv().await {
                 let alive = this
-                    .update(cx, |app, cx| app.on_sync_event(event, cx))
+                    .update(cx, |app, cx| app.on_net_event(event, cx))
                     .is_ok();
                 if !alive {
                     break;
@@ -70,39 +77,107 @@ impl SyncitApp {
             desc,
             active: false,
             count: 0,
+            doc: AutoCommit::new(),
+            sync_state: automerge::sync::State::new(),
             status: SyncStatus::Connecting,
-            changes,
+            sync_enabled: true,
+            net_tx,
             last_name: String::new(),
             last_desc: String::new(),
-            _events_task: events_task,
+            _net_task: net_task,
         }
     }
 
-    fn on_sync_event(&mut self, event: SyncEvent, cx: &mut Context<Self>) {
-        match event {
-            SyncEvent::Status(status) => self.status = status,
-            SyncEvent::Doc(doc) => {
-                self.active = doc.active;
-                self.count = doc.count.value();
-                if doc.name != self.last_name {
-                    self.last_name = doc.name.clone();
-                    self.name
-                        .update(cx, |input, cx| input.set_content(doc.name, cx));
-                }
-                let desc = doc.desc.as_str().to_string();
-                if desc != self.last_desc {
-                    self.last_desc = desc.clone();
-                    self.desc.update(cx, |input, cx| input.set_content(desc, cx));
-                }
+    /// Apply a local edit to the doc, then push it out and refresh the view.
+    /// Before the first sync the doc is empty and can't hydrate; seed it with
+    /// the default doc so early offline edits still land (automerge merges
+    /// with the server's copy once we connect).
+    fn edit(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut SyncItDoc)) {
+        let mut sd: SyncItDoc =
+            autosurgeon::hydrate(&self.doc).unwrap_or_else(|_| SyncItDoc::new());
+        f(&mut sd);
+        if let Err(err) = autosurgeon::reconcile(&mut self.doc, &sd) {
+            eprintln!("sync: failed to apply local edit: {err:#}");
+        }
+        self.pump();
+        self.refresh_from_doc(cx);
+        cx.notify();
+    }
+
+    /// Send every sync message the doc currently has queued up.
+    fn pump(&mut self) {
+        if self.status != SyncStatus::Connected {
+            return;
+        }
+        while let Some(msg) = self.doc.sync().generate_sync_message(&mut self.sync_state) {
+            if self.net_tx.send(NetCmd::Send(msg.encode())).is_err() {
+                break;
             }
         }
+    }
+
+    fn toggle_sync(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_enabled = !self.sync_enabled;
+        self.net_tx
+            .send(NetCmd::SetEnabled(self.sync_enabled))
+            .ok();
         cx.notify();
+    }
+
+    fn on_net_event(&mut self, event: NetEvent, cx: &mut Context<Self>) {
+        match event {
+            NetEvent::Status(status) => {
+                self.status = status;
+                if status == SyncStatus::Connected {
+                    // Sync protocol state is per-connection; start fresh.
+                    self.sync_state = automerge::sync::State::new();
+                    self.pump();
+                }
+            }
+            NetEvent::Recv(bytes) => match automerge::sync::Message::decode(&bytes) {
+                Ok(msg) => {
+                    let heads_before = self.doc.get_heads();
+                    if let Err(err) = self
+                        .doc
+                        .sync()
+                        .receive_sync_message(&mut self.sync_state, msg)
+                    {
+                        eprintln!("sync: failed to apply sync message: {err:#}");
+                    }
+                    self.pump();
+                    if self.doc.get_heads() != heads_before {
+                        self.refresh_from_doc(cx);
+                    }
+                }
+                Err(err) => eprintln!("sync: bad sync message: {err:#}"),
+            },
+        }
+        cx.notify();
+    }
+
+    /// Update the view state from the doc, leaving the text inputs alone
+    /// unless their content actually changed.
+    fn refresh_from_doc(&mut self, cx: &mut Context<Self>) {
+        let Ok(sd) = autosurgeon::hydrate::<_, SyncItDoc>(&self.doc) else {
+            return; // empty doc, nothing synced yet
+        };
+        self.active = sd.active;
+        self.count = sd.count.value();
+        if sd.name != self.last_name {
+            self.last_name = sd.name.clone();
+            self.name
+                .update(cx, |input, cx| input.set_content(sd.name, cx));
+        }
+        let desc = sd.desc.as_str().to_string();
+        if desc != self.last_desc {
+            self.last_desc = desc.clone();
+            self.desc.update(cx, |input, cx| input.set_content(desc, cx));
+        }
     }
 
     fn toggle_active(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.active = !self.active;
-        self.changes.send(LocalChange::SetActive(self.active)).ok();
-        cx.notify();
+        let active = !self.active;
+        self.edit(cx, |sd| sd.active = active);
     }
 
     fn row(label: &'static str, content: impl IntoElement) -> impl IntoElement {
@@ -134,9 +209,7 @@ impl SyncitApp {
             .cursor_pointer()
             .child(label)
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                this.count += delta;
-                this.changes.send(LocalChange::IncrementCount(delta)).ok();
-                cx.notify();
+                this.edit(cx, |sd| sd.count.increment(delta));
             }))
     }
 }
@@ -188,14 +261,26 @@ impl Render for SyncitApp {
             SyncStatus::Connecting => (rgb(0xf9e2af), "Connecting…"),
             SyncStatus::Connected => (rgb(0xa6e3a1), "Synced"),
             SyncStatus::Offline => (rgb(0xf38ba8), "Offline (unsynced)"),
+            SyncStatus::Paused => (rgb(0x6c7086), "Sync off (unsynced)"),
         };
+        let toggle = div()
+            .id("sync-toggle")
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .bg(rgb(0x45475a))
+            .hover(|style| style.bg(rgb(0x585b70)))
+            .cursor_pointer()
+            .child(if self.sync_enabled { "Pause" } else { "Resume" })
+            .on_click(cx.listener(Self::toggle_sync));
         let status = div()
             .flex()
             .items_center()
             .gap_2()
             .py_1()
             .child(div().w(px(10.)).h(px(10.)).rounded_full().bg(dot_color))
-            .child(div().text_color(rgb(0xa6adc8)).child(status_text));
+            .child(div().text_color(rgb(0xa6adc8)).child(status_text))
+            .child(toggle);
 
         div()
             .flex()
@@ -216,10 +301,10 @@ impl Render for SyncitApp {
 
 fn main() {
     // GPUI must own the main thread, so build an explicit tokio runtime for
-    // the sync actor instead of #[tokio::main]. It lives here on main's stack
-    // for the duration of the app.
+    // the network shuttle instead of #[tokio::main]. It lives here on main's
+    // stack for the duration of the app.
     let runtime = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
-    let (changes, events) = sync::start(runtime.handle());
+    let (net_tx, events) = sync::start(runtime.handle());
 
     gpui_platform::application().run(move |cx: &mut App| {
         text_input::bind_keys(cx);
@@ -236,7 +321,7 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |_window, cx| cx.new(|cx| SyncitApp::new(cx, changes, events)),
+                |_window, cx| cx.new(|cx| SyncitApp::new(cx, net_tx, events)),
             )
             .unwrap();
 
